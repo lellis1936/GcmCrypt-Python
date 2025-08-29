@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # gcmcrypt.py — GcmCrypt-compatible with identical console messages/timings.
 
-import argparse, os, sys, struct, zlib, gzip, getpass, hashlib, time
+import argparse, os, struct, zlib, gzip, hashlib, time
 
 # AES-GCM backend
 _BACKEND = None
@@ -94,13 +94,6 @@ def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_siz
         mk = _pbkdf2_sha256(password.encode("utf-8"), salt, iterations, KEY_LEN)
         print(f"Key derivation took {int((time.time()-sw)*1000)} ms")
 
-        # Prepare input
-        with open(infile, "rb") as f:
-            data = f.read()
-        if do_compress:
-            # Use GZIP framing to match .NET output we observed (1f 8b header)
-            data = gzip.compress(data)
-
         # FEK wrap
         fek = os.urandom(KEY_LEN)
         fek_ct, fek_tag = _aesgcm_encrypt(mk, FEK_NONCE, fek, aad=None)
@@ -118,24 +111,44 @@ def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_siz
         assert len(header) == V1_HEADER_LEN
         _, header_tag = _aesgcm_encrypt(mk, HEADER_NONCE, b"", aad=bytes(header))
 
-        # Encrypt data
         sw = time.time()
-        out = bytearray()
-        out += header
-        out += header_tag
-        nonce = bytearray(NONCE_LEN)
-        offset = 0
-        total = len(data)
-        while offset < total:
-            _inc_nonce(nonce)
-            chunk = data[offset: offset+chunk_size]
-            ct, tag = _aesgcm_encrypt(fek, bytes(nonce), chunk, aad=None)
-            out += ct
-            out += tag
-            offset += len(chunk)
+        with open(outfile, "wb") as fout:
+            # Write header + tag
+            fout.write(header)
+            fout.write(header_tag)
 
-        with open(outfile, "wb") as f:
-            f.write(out)
+            nonce = bytearray(NONCE_LEN)
+
+            # Streaming compression + chunked encryption
+            comp = zlib.compressobj(wbits=16 + zlib.MAX_WBITS) if do_compress else None
+            buf = bytearray()
+
+            with open(infile, "rb") as fin:
+                while True:
+                    plain = fin.read(1024 * 1024)  # 1MB disk reads
+                    if not plain:
+                        break
+                    buf += comp.compress(plain) if comp else plain
+
+                    # Drain full chunks to AES-GCM
+                    while len(buf) >= chunk_size:
+                        _inc_nonce(nonce)
+                        part = bytes(buf[:chunk_size])
+                        del buf[:chunk_size]
+                        ct, tag = _aesgcm_encrypt(fek, bytes(nonce), part, aad=None)
+                        fout.write(ct)
+                        fout.write(tag)
+
+                # Finish compressor if used
+                if comp:
+                    buf += comp.flush()
+
+                # Emit any tail (final partial chunk)
+                if buf:
+                    _inc_nonce(nonce)
+                    ct, tag = _aesgcm_encrypt(fek, bytes(nonce), bytes(buf), aad=None)
+                    fout.write(ct)
+                    fout.write(tag)
 
         print("File encrypted. AES GCM encryption took {0} ms".format(int((time.time()-sw)*1000)))
     except Exception as ex:
@@ -149,67 +162,112 @@ def decrypt(password, infile, outfile, force=False):
 
     try:
         with open(infile, "rb") as f:
-            blob = f.read()
+            # Read & verify header (streaming)
+            def _read_exact(n):
+                b = f.read(n)
+                if len(b) != n:
+                    raise ValueError("Truncated header.")
+                return b
 
-        # Parse header
-        if len(blob) < (V1_HEADER_LEN + TAG_LEN):
-            print("Unsupported input file version")
-            return
-        p = 0
-        magic = blob[p:p+3]; p+=3
-        if magic != MAGIC:
-            print("Unsupported input file version")
-            return
-        verMajor = blob[p]; p+=1
-        verMinor = blob[p]; p+=1
-        if verMajor != 1 or verMinor not in (1,2):
-            print("Unsupported input file version")
-            return
-        salt = blob[p:p+SALT_LEN]; p+=SALT_LEN
-        fek_ct = blob[p:p+KEY_LEN]; p+=KEY_LEN
-        fek_tag = blob[p:p+TAG_LEN]; p+=TAG_LEN
-        compressed_flag = blob[p]; p+=1
-        chunk_size = struct.unpack(">I", blob[p:p+4])[0]; p+=4
-        header = blob[:V1_HEADER_LEN]
-        header_tag = blob[p:p+TAG_LEN]; p+=TAG_LEN
+            magic = _read_exact(3)
+            if magic != MAGIC:
+                print("Unsupported input file version")
+                return
 
-        # KDF (v1.1 vs v1.2)
-        iterations = 10000 if verMinor == 1 else 100000
-        sw = time.time()
-        mk = _pbkdf2_sha256(password.encode("utf-8"), salt, iterations, KEY_LEN)
-        print(f"Key derivation took {int((time.time()-sw)*1000)} ms")
+            verMajor = _read_exact(1)
+            verMinor = _read_exact(1)
+            if verMajor != b"\x01" or verMinor not in (b"\x01", b"\x02"):
+                print("Unsupported input file version")
+                return
 
-        # Verify header tag
-        _ = _aesgcm_decrypt(mk, HEADER_NONCE, b"", header_tag, aad=header)
+            salt     = _read_exact(SALT_LEN)
+            fek_ct   = _read_exact(KEY_LEN)
+            fek_tag  = _read_exact(TAG_LEN)
+            compflag = _read_exact(1)
+            be_chunk = _read_exact(4)
 
-        # Unwrap FEK
-        fek = _aesgcm_decrypt(mk, FEK_NONCE, fek_ct, fek_tag, aad=None)
+            header = MAGIC + verMajor + verMinor + salt + fek_ct + fek_tag + compflag + be_chunk
+            assert len(header) == V1_HEADER_LEN
 
-        # Decrypt chunks
-        sw = time.time()
-        nonce = bytearray(NONCE_LEN)
-        out = bytearray()
-        i = p
-        n = len(blob)
-        while i < n:
-            _inc_nonce(nonce)
-            remaining = n - i
-            if remaining < TAG_LEN:
-                raise ValueError("Truncated chunk/tag.")
-            ct_len = chunk_size if remaining >= (chunk_size + TAG_LEN) else (remaining - TAG_LEN)
-            ct = blob[i:i+ct_len]; i += ct_len
-            tag = blob[i:i+TAG_LEN]; i += TAG_LEN
-            pt = _aesgcm_decrypt(fek, bytes(nonce), ct, tag, aad=None)
-            out += pt
+            header_tag = _read_exact(TAG_LEN)
 
-        if compressed_flag == 1:
-            # Use GZIP framing to match .NET output we observed
-            out = gzip.decompress(out)
+            # KDF (v1.1 vs v1.2)
+            iterations = 10000 if verMinor == b"\x01" else 100000
+            sw = time.time()
+            mk = _pbkdf2_sha256(password.encode("utf-8"), salt, iterations, KEY_LEN)
+            print(f"Key derivation took {int((time.time()-sw)*1000)} ms")
 
-        with open(outfile, "wb") as f:
-            f.write(out)
+            # Verify header tag
+            _ = _aesgcm_decrypt(mk, HEADER_NONCE, b"", header_tag, aad=header)
 
-        print("File decrypted successfully. AES GCM decryption took {0} ms.".format(int((time.time()-sw)*1000)))
+            # Unwrap FEK
+            fek = _aesgcm_decrypt(mk, FEK_NONCE, fek_ct, fek_tag, aad=None)
+
+            chunk_size = struct.unpack(">I", be_chunk)[0]
+            compressed_flag = compflag[0] == 1
+
+            # Prepare decompressor if needed (GZIP framing)
+            decomp = zlib.decompressobj(16 + zlib.MAX_WBITS) if compressed_flag else None
+
+            sw = time.time()
+            nonce = bytearray(NONCE_LEN)
+
+            with open(outfile, "wb") as fout:
+                while True:
+                    # Try to read one ciphertext chunk (up to chunk_size) and its tag
+                    ct_chunk = f.read(chunk_size)
+                    if not ct_chunk:
+                        break  # no more data
+
+                    tag_read = f.read(TAG_LEN)
+
+                    # Normal case: full chunk + full tag
+                    if len(ct_chunk) == chunk_size and len(tag_read) == TAG_LEN:
+                        _inc_nonce(nonce)
+                        pt = _aesgcm_decrypt(fek, bytes(nonce), ct_chunk, tag_read, aad=None)
+                        if decomp:
+                            if pt:
+                                out = decomp.decompress(pt)
+                                if out:
+                                    fout.write(out)
+                        else:
+                            if pt:
+                                fout.write(pt)
+                        continue
+
+                    # Edge case: final block where part (or all) of the tag
+                    # was consumed into ct_chunk by the fixed-size read
+                    if len(ct_chunk) < TAG_LEN and len(tag_read) == 0:
+                        raise ValueError("Truncated chunk/tag.")
+
+                    ciphertext_len = len(ct_chunk) + len(tag_read) - TAG_LEN
+                    if ciphertext_len < 0:
+                        raise ValueError("Truncated chunk/tag.")
+
+                    tag = ct_chunk[ciphertext_len:] + tag_read
+                    ct  = ct_chunk[:ciphertext_len]
+
+                    _inc_nonce(nonce)
+                    pt = _aesgcm_decrypt(fek, bytes(nonce), ct, tag, aad=None)
+
+                    if decomp:
+                        if pt:
+                            out = decomp.decompress(pt)
+                            if out:
+                                fout.write(out)
+                    else:
+                        if pt:
+                            fout.write(pt)
+
+                    break  # this was the final chunk
+
+                if decomp:
+                    # Flush any remaining decompressed bytes (gzip trailer)
+                    tail = decomp.flush()
+                    if tail:
+                        fout.write(tail)
+
+            print("File decrypted successfully. AES GCM decryption took {0} ms.".format(int((time.time()-sw)*1000)))
     except Exception as ex:
         msg = str(ex).strip()
         if not msg:
