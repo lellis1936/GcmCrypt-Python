@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # gcmcrypt.py — GcmCrypt-compatible with identical console messages/timings.
 
-import argparse, os, sys, struct, zlib, getpass, hashlib, time
+import argparse, os, sys, struct, zlib, gzip, getpass, hashlib, time
 
 # AES-GCM backend
 _BACKEND = None
@@ -98,7 +98,8 @@ def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_siz
         with open(infile, "rb") as f:
             data = f.read()
         if do_compress:
-            data = zlib.compress(data)
+            # Use GZIP framing to match .NET output we observed (1f 8b header)
+            data = gzip.compress(data)
 
         # FEK wrap
         fek = os.urandom(KEY_LEN)
@@ -202,7 +203,8 @@ def decrypt(password, infile, outfile, force=False):
             out += pt
 
         if compressed_flag == 1:
-            out = zlib.decompress(out)
+            # Use GZIP framing to match .NET output we observed
+            out = gzip.decompress(out)
 
         with open(outfile, "wb") as f:
             f.write(out)
