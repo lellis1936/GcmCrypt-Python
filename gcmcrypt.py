@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # gcmcrypt.py — GcmCrypt-compatible with identical console messages/timings.
 
-import argparse, os, struct, zlib, gzip, hashlib, time
+import hashlib
+import os
+import struct
+import sys
+import time
+import zlib
 
 # AES-GCM backend
 _BACKEND = None
@@ -17,13 +22,15 @@ except Exception:
 
 # Constants per Program.cs
 MAGIC = b"GCM"
+APP_VERSION = "1.4.1"
 VER_MAJOR = 1
-VER_MINOR = 2  # write 1.2; read accepts 1.1/1.2
+VER_MINOR = 3
 NONCE_LEN = 12
 KEY_LEN   = 32
 TAG_LEN   = 16
 SALT_LEN  = 16
-V1_HEADER_LEN = 74
+V1_1_V1_2_HEADER_LEN = 74
+V1_3_HEADER_LEN = 82
 HEADER_NONCE = bytes([0xFF])*NONCE_LEN
 FEK_NONCE    = bytes([0x00])*NONCE_LEN
 DEFAULT_CHUNK = 64*1024
@@ -67,8 +74,7 @@ def _aesgcm_decrypt(key, nonce, ciphertext, tag, aad):
         raise RuntimeError("No AES-GCM backend available. Install 'cryptography' or 'pycryptodome'.")
 
 def print_usage():
-    version = f"{VER_MAJOR}.{VER_MINOR}"
-    print(f"GcmCrypt v{version}")
+    print(f"GcmCrypt v{APP_VERSION}")
     print("Usage is : ")
     print("\tpython GcmCrypt.py -e|-d [-f] [-compress] password infile outfile. ")
     print()
@@ -89,7 +95,7 @@ def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_siz
     try:
         # KDF timing
         salt = os.urandom(SALT_LEN)
-        iterations = 100000  # v1.2
+        iterations = 100000
         sw = time.time()
         mk = _pbkdf2_sha256(password.encode("utf-8"), salt, iterations, KEY_LEN)
         print(f"Key derivation took {int((time.time()-sw)*1000)} ms")
@@ -108,7 +114,8 @@ def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_siz
         header += fek_tag
         header += bytes([1 if do_compress else 0])
         header += struct.pack(">I", chunk_size)
-        assert len(header) == V1_HEADER_LEN
+        header += struct.pack(">q", os.path.getsize(infile))
+        assert len(header) == V1_3_HEADER_LEN
         _, header_tag = _aesgcm_encrypt(mk, HEADER_NONCE, b"", aad=bytes(header))
 
         sw = time.time()
@@ -160,6 +167,9 @@ def decrypt(password, infile, outfile, force=False):
     if (not force) and os.path.exists(outfile):
         raise SystemExit("Decryption failed: Output file exists (use -f)")
 
+    partial_outfile = outfile + ".PARTIAL"
+    partial_output_created = False
+
     try:
         with open(infile, "rb") as f:
             # Read & verify header (streaming)
@@ -176,7 +186,7 @@ def decrypt(password, infile, outfile, force=False):
 
             verMajor = _read_exact(1)
             verMinor = _read_exact(1)
-            if verMajor != b"\x01" or verMinor not in (b"\x01", b"\x02"):
+            if verMajor != b"\x01" or verMinor not in (b"\x01", b"\x02", b"\x03"):
                 print("Unsupported input file version")
                 return
 
@@ -185,9 +195,16 @@ def decrypt(password, infile, outfile, force=False):
             fek_tag  = _read_exact(TAG_LEN)
             compflag = _read_exact(1)
             be_chunk = _read_exact(4)
+            be_original_length = _read_exact(8) if verMinor == b"\x03" else b""
 
-            header = MAGIC + verMajor + verMinor + salt + fek_ct + fek_tag + compflag + be_chunk
-            assert len(header) == V1_HEADER_LEN
+            header = (
+                MAGIC + verMajor + verMinor + salt + fek_ct + fek_tag
+                + compflag + be_chunk + be_original_length
+            )
+            expected_header_len = (
+                V1_3_HEADER_LEN if verMinor == b"\x03" else V1_1_V1_2_HEADER_LEN
+            )
+            assert len(header) == expected_header_len
 
             header_tag = _read_exact(TAG_LEN)
 
@@ -205,6 +222,11 @@ def decrypt(password, infile, outfile, force=False):
 
             chunk_size = struct.unpack(">I", be_chunk)[0]
             compressed_flag = compflag[0] == 1
+            expected_plaintext_length = -1
+            if verMinor == b"\x03":
+                expected_plaintext_length = struct.unpack(">q", be_original_length)[0]
+                if expected_plaintext_length < 0:
+                    raise ValueError("Encrypted file contains an invalid plaintext length")
 
             # Prepare decompressor if needed (GZIP framing)
             decomp = zlib.decompressobj(16 + zlib.MAX_WBITS) if compressed_flag else None
@@ -212,7 +234,8 @@ def decrypt(password, infile, outfile, force=False):
             sw = time.time()
             nonce = bytearray(NONCE_LEN)
 
-            with open(outfile, "wb") as fout:
+            with open(partial_outfile, "wb") as fout:
+                partial_output_created = True
                 while True:
                     # Try to read one ciphertext chunk (up to chunk_size) and its tag
                     ct_chunk = f.read(chunk_size)
@@ -266,36 +289,80 @@ def decrypt(password, infile, outfile, force=False):
                     tail = decomp.flush()
                     if tail:
                         fout.write(tail)
+                    if not decomp.eof:
+                        raise ValueError("Compressed data is incomplete")
 
+                if (
+                    expected_plaintext_length >= 0
+                    and fout.tell() != expected_plaintext_length
+                ):
+                    raise ValueError(
+                        "Decrypted file length mismatch. Expected {0} bytes, got {1} bytes".format(
+                            expected_plaintext_length, fout.tell()
+                        )
+                    )
+
+            os.replace(partial_outfile, outfile)
+            partial_output_created = False
             print("File decrypted successfully. AES GCM decryption took {0} ms.".format(int((time.time()-sw)*1000)))
     except Exception as ex:
         msg = str(ex).strip()
         if not msg:
             msg = "likely wrong password or corrupted file"
         print(f"Decryption failed: {msg}")
+        if partial_output_created and os.path.exists(partial_outfile):
+            print(f"Partial output retained as: {partial_outfile}")
     finally:
         print()
 
-def main():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("-e", "--encrypt", action="store_true")
-    parser.add_argument("-d", "--decrypt", action="store_true")
-    parser.add_argument("-f", action="store_true")
-    parser.add_argument("-compress", action="store_true")
-    parser.add_argument("password", nargs="?")
-    parser.add_argument("infile", nargs="?")
-    parser.add_argument("outfile", nargs="?")
-    args, unknown = parser.parse_known_args()
+def _prompt_confirmation(confirm_text):
+    while True:
+        response = input(confirm_text + " [y/n] : ").strip().lower()
+        if response in ("y", "n"):
+            return response == "y"
 
-    # Match .NET usage behavior if args are insufficient
-    if not (args.encrypt ^ args.decrypt) or args.password is None or args.infile is None or args.outfile is None:
+def _parse_args(argv):
+    encrypting = False
+    decrypting = False
+    compress = False
+    force = False
+    parameters = []
+
+    for arg in argv:
+        if arg.startswith("-"):
+            option = arg.lower()
+            if option == "-e":
+                encrypting = True
+            elif option == "-d":
+                decrypting = True
+            elif option == "-f":
+                force = True
+            elif option == "-compress":
+                compress = True
+        else:
+            parameters.append(arg)
+
+    if encrypting == decrypting or len(parameters) != 3:
+        return None
+
+    return encrypting, force, compress, parameters[0], parameters[1], parameters[2]
+
+def main(argv=None):
+    parsed = _parse_args(sys.argv[1:] if argv is None else argv)
+    if parsed is None:
         print_usage()
         return
 
-    if args.encrypt:
-        encrypt(args.password, args.infile, args.outfile, force=args.f, do_compress=args.compress)
+    encrypting, force, compress, password, infile, outfile = parsed
+
+    if not force and os.path.exists(outfile):
+        if not _prompt_confirmation("Output file already exists.  Do you want to overwrite it?"):
+            return
+
+    if encrypting:
+        encrypt(password, infile, outfile, force=True, do_compress=compress)
     else:
-        decrypt(args.password, args.infile, args.outfile, force=args.f)
+        decrypt(password, infile, outfile, force=True)
 
 if __name__ == "__main__":
     main()

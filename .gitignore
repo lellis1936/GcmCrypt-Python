@@ -16,3 +16,6 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Test output
+smoke-test-output/
