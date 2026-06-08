@@ -22,21 +22,32 @@ except Exception:
 
 # Constants per Program.cs
 MAGIC = b"GCM"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 VER_MAJOR = 1
-VER_MINOR = 3
+VER_MINOR = 5
 NONCE_LEN = 12
 KEY_LEN   = 32
 TAG_LEN   = 16
 SALT_LEN  = 16
 V1_1_V1_2_HEADER_LEN = 74
 V1_3_HEADER_LEN = 82
+V1_5_HEADER_LEN = 86
+DEFAULT_PBKDF2_ITERATIONS = 600000
+MIN_PBKDF2_ITERATIONS = 100000
+MAX_PBKDF2_ITERATIONS = 10000000
 HEADER_NONCE = bytes([0xFF])*NONCE_LEN
 FEK_NONCE    = bytes([0x00])*NONCE_LEN
 DEFAULT_CHUNK = 64*1024
 
 def _pbkdf2_sha256(password, salt, iterations, dklen=32):
     return hashlib.pbkdf2_hmac("sha256", password, salt, iterations, dklen)
+
+def _validate_pbkdf2_iterations(iterations):
+    if (
+        iterations < MIN_PBKDF2_ITERATIONS
+        or iterations > MAX_PBKDF2_ITERATIONS
+    ):
+        raise ValueError("Encrypted file contains an invalid PBKDF2 iteration count")
 
 def _inc_nonce(nonce):
     for i in range(len(nonce)-1, -1, -1):
@@ -76,28 +87,46 @@ def _aesgcm_decrypt(key, nonce, ciphertext, tag, aad):
 def print_usage():
     print(f"GcmCrypt v{APP_VERSION}")
     print("Usage is : ")
-    print("\tpython GcmCrypt.py -e|-d [-f] [-compress] password infile outfile. ")
+    print("\tpython GcmCrypt.py -e|-d [-f] [-compress] [-iter count] password infile outfile. ")
     print()
     print("Examples:")
-    print("\tpython GcmCrypt.py -e -compress mypass myinputfile myencryptedoutputfile")
+    print("\tpython GcmCrypt.py -e -compress -iter 600000 mypass myinputfile myencryptedoutputfile")
     print("\tpython GcmCrypt.py -d mypass myencryptedinputfile mydecryptedoutputfile")
     print()
     print("\n-compress option only needed for encryption")
+    print(
+        "\n-iter option only applies to encryption and accepts {0} to {1}".format(
+            MIN_PBKDF2_ITERATIONS, MAX_PBKDF2_ITERATIONS
+        )
+    )
     print("\n-f option will silently overwrite the output file if it exists")
     print()
 
-def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_size=DEFAULT_CHUNK):
+def encrypt(
+    password,
+    infile,
+    outfile,
+    force=False,
+    do_compress=False,
+    chunk_size=DEFAULT_CHUNK,
+    iterations=DEFAULT_PBKDF2_ITERATIONS,
+):
     if not _BACKEND:
         raise SystemExit("Encryption failed: AES-GCM backend not available")
     if (not force) and os.path.exists(outfile):
         raise SystemExit("Encryption failed: Output file exists (use -f)")
+    _validate_pbkdf2_iterations(iterations)
 
     try:
         # KDF timing
         salt = os.urandom(SALT_LEN)
-        iterations = 100000
         sw = time.time()
-        mk = _pbkdf2_sha256(password.encode("utf-8"), salt, iterations, KEY_LEN)
+        mk = _pbkdf2_sha256(
+            password.encode("utf-8"),
+            salt,
+            iterations,
+            KEY_LEN,
+        )
         print(f"Key derivation took {int((time.time()-sw)*1000)} ms")
 
         # FEK wrap
@@ -115,7 +144,8 @@ def encrypt(password, infile, outfile, force=False, do_compress=False, chunk_siz
         header += bytes([1 if do_compress else 0])
         header += struct.pack(">I", chunk_size)
         header += struct.pack(">q", os.path.getsize(infile))
-        assert len(header) == V1_3_HEADER_LEN
+        header += struct.pack(">I", iterations)
+        assert len(header) == V1_5_HEADER_LEN
         _, header_tag = _aesgcm_encrypt(mk, HEADER_NONCE, b"", aad=bytes(header))
 
         sw = time.time()
@@ -181,12 +211,14 @@ def decrypt(password, infile, outfile, force=False):
 
             magic = _read_exact(3)
             if magic != MAGIC:
-                print("Unsupported input file version")
+                print("Input file is not a GcmCrypt file")
                 return
 
             verMajor = _read_exact(1)
             verMinor = _read_exact(1)
-            if verMajor != b"\x01" or verMinor not in (b"\x01", b"\x02", b"\x03"):
+            if verMajor != b"\x01" or verMinor not in (
+                b"\x01", b"\x02", b"\x03", b"\x05"
+            ):
                 print("Unsupported input file version")
                 return
 
@@ -195,23 +227,40 @@ def decrypt(password, infile, outfile, force=False):
             fek_tag  = _read_exact(TAG_LEN)
             compflag = _read_exact(1)
             be_chunk = _read_exact(4)
-            be_original_length = _read_exact(8) if verMinor == b"\x03" else b""
+            be_original_length = (
+                _read_exact(8) if verMinor in (b"\x03", b"\x05") else b""
+            )
+            be_kdf_iterations = _read_exact(4) if verMinor == b"\x05" else b""
 
             header = (
                 MAGIC + verMajor + verMinor + salt + fek_ct + fek_tag
-                + compflag + be_chunk + be_original_length
+                + compflag + be_chunk + be_original_length + be_kdf_iterations
             )
-            expected_header_len = (
-                V1_3_HEADER_LEN if verMinor == b"\x03" else V1_1_V1_2_HEADER_LEN
-            )
+            if verMinor == b"\x05":
+                expected_header_len = V1_5_HEADER_LEN
+            elif verMinor == b"\x03":
+                expected_header_len = V1_3_HEADER_LEN
+            else:
+                expected_header_len = V1_1_V1_2_HEADER_LEN
             assert len(header) == expected_header_len
 
             header_tag = _read_exact(TAG_LEN)
 
-            # KDF (v1.1 vs v1.2)
-            iterations = 10000 if verMinor == b"\x01" else 100000
             sw = time.time()
-            mk = _pbkdf2_sha256(password.encode("utf-8"), salt, iterations, KEY_LEN)
+            if verMinor == b"\x05":
+                iterations = struct.unpack(">I", be_kdf_iterations)[0]
+                _validate_pbkdf2_iterations(iterations)
+                mk = _pbkdf2_sha256(
+                    password.encode("utf-8"),
+                    salt,
+                    iterations,
+                    KEY_LEN,
+                )
+            else:
+                iterations = 10000 if verMinor == b"\x01" else 100000
+                mk = _pbkdf2_sha256(
+                    password.encode("utf-8"), salt, iterations, KEY_LEN
+                )
             print(f"Key derivation took {int((time.time()-sw)*1000)} ms")
 
             # Verify header tag
@@ -223,7 +272,7 @@ def decrypt(password, infile, outfile, force=False):
             chunk_size = struct.unpack(">I", be_chunk)[0]
             compressed_flag = compflag[0] == 1
             expected_plaintext_length = -1
-            if verMinor == b"\x03":
+            if verMinor in (b"\x03", b"\x05"):
                 expected_plaintext_length = struct.unpack(">q", be_original_length)[0]
                 if expected_plaintext_length < 0:
                     raise ValueError("Encrypted file contains an invalid plaintext length")
@@ -326,9 +375,13 @@ def _parse_args(argv):
     decrypting = False
     compress = False
     force = False
+    iterations = DEFAULT_PBKDF2_ITERATIONS
+    iterations_specified = False
     parameters = []
 
-    for arg in argv:
+    arg_index = 0
+    while arg_index < len(argv):
+        arg = argv[arg_index]
         if arg.startswith("-"):
             option = arg.lower()
             if option == "-e":
@@ -339,13 +392,37 @@ def _parse_args(argv):
                 force = True
             elif option == "-compress":
                 compress = True
+            elif option == "-iter":
+                iterations_specified = True
+                arg_index += 1
+                if arg_index >= len(argv):
+                    return None
+                try:
+                    iterations = int(argv[arg_index])
+                except ValueError:
+                    return None
+                if (
+                    iterations < MIN_PBKDF2_ITERATIONS
+                    or iterations > MAX_PBKDF2_ITERATIONS
+                ):
+                    return None
         else:
             parameters.append(arg)
+        arg_index += 1
 
     if encrypting == decrypting or len(parameters) != 3:
         return None
 
-    return encrypting, force, compress, parameters[0], parameters[1], parameters[2]
+    return (
+        encrypting,
+        force,
+        compress,
+        iterations,
+        iterations_specified,
+        parameters[0],
+        parameters[1],
+        parameters[2],
+    )
 
 def main(argv=None):
     parsed = _parse_args(sys.argv[1:] if argv is None else argv)
@@ -353,14 +430,35 @@ def main(argv=None):
         print_usage()
         return
 
-    encrypting, force, compress, password, infile, outfile = parsed
+    (
+        encrypting,
+        force,
+        compress,
+        iterations,
+        iterations_specified,
+        password,
+        infile,
+        outfile,
+    ) = parsed
+
+    if not encrypting and iterations_specified:
+        print("-iter is only valid for encryption.")
+        print_usage()
+        return
 
     if not force and os.path.exists(outfile):
         if not _prompt_confirmation("Output file already exists.  Do you want to overwrite it?"):
             return
 
     if encrypting:
-        encrypt(password, infile, outfile, force=True, do_compress=compress)
+        encrypt(
+            password,
+            infile,
+            outfile,
+            force=True,
+            do_compress=compress,
+            iterations=iterations,
+        )
     else:
         decrypt(password, infile, outfile, force=True)
 

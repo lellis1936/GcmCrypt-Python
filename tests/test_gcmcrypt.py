@@ -26,14 +26,38 @@ class GcmCryptTests(unittest.TestCase):
 
     def test_cli_parser_matches_csharp_switch_behavior(self):
         self.assertEqual(
-            (True, True, True, "password", "input", "output"),
+            (
+                True,
+                True,
+                True,
+                gcmcrypt.DEFAULT_PBKDF2_ITERATIONS,
+                False,
+                "password",
+                "input",
+                "output",
+            ),
             gcmcrypt._parse_args(
                 ["-E", "-F", "-COMPRESS", "password", "input", "output"]
             ),
         )
         self.assertEqual(
-            (False, False, False, "password", "input", "output"),
+            (
+                False,
+                False,
+                False,
+                gcmcrypt.DEFAULT_PBKDF2_ITERATIONS,
+                False,
+                "password",
+                "input",
+                "output",
+            ),
             gcmcrypt._parse_args(["-D", "-unknown", "password", "input", "output"]),
+        )
+        self.assertEqual(
+            (True, False, False, 750000, True, "password", "input", "output"),
+            gcmcrypt._parse_args(
+                ["-e", "-iter", "750000", "password", "input", "output"]
+            ),
         )
 
     def test_cli_parser_requires_one_mode_and_exactly_three_parameters(self):
@@ -43,6 +67,10 @@ class GcmCryptTests(unittest.TestCase):
             ["-e", "password", "input"],
             ["-e", "password", "input", "output", "extra"],
             ["--encrypt", "password", "input", "output"],
+            ["-e", "-iter", "99999", "password", "input", "output"],
+            ["-e", "-iter", "10000001", "password", "input", "output"],
+            ["-e", "-iter", "not-a-number", "password", "input", "output"],
+            ["-e", "-iter", "password", "input", "output"],
         )
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
@@ -95,6 +123,8 @@ class GcmCryptTests(unittest.TestCase):
             + b"\x00"
             + struct.pack(">I", gcmcrypt.DEFAULT_CHUNK)
         )
+        if minor_version == 3:
+            header += struct.pack(">q", len(data))
         _, header_tag = gcmcrypt._aesgcm_encrypt(
             master_key, gcmcrypt.HEADER_NONCE, b"", aad=header
         )
@@ -122,18 +152,51 @@ class GcmCryptTests(unittest.TestCase):
     def test_round_trip_compressed(self):
         self.round_trip((b"GcmCrypt compression test\n" * 10000), compressed=True)
 
-    def test_writes_authenticated_v1_3_plaintext_length(self):
+    def test_writes_v1_5_pbkdf2_iterations(self):
         data = b"authenticated length"
         encrypted = self.round_trip(data)
         with open(encrypted, "rb") as stream:
-            header = stream.read(gcmcrypt.V1_3_HEADER_LEN)
+            header = stream.read(gcmcrypt.V1_5_HEADER_LEN)
 
-        self.assertEqual(b"GCM\x01\x03", header[:5])
-        self.assertEqual(len(data), struct.unpack(">q", header[-8:])[0])
+        self.assertEqual(b"GCM\x01\x05", header[:5])
+        self.assertEqual(len(data), struct.unpack(">q", header[74:82])[0])
+        self.assertEqual(
+            gcmcrypt.DEFAULT_PBKDF2_ITERATIONS,
+            struct.unpack(">I", header[82:86])[0],
+        )
 
-    def test_reads_legacy_v1_1_and_v1_2(self):
+    def test_custom_iteration_count_round_trips(self):
+        source = self.path("source.bin")
+        encrypted = self.path("encrypted.gcm")
+        decrypted = self.path("decrypted.bin")
+        with open(source, "wb") as stream:
+            stream.write(b"custom iterations")
+
+        self.capture(
+            gcmcrypt.encrypt,
+            self.PASSWORD,
+            source,
+            encrypted,
+            force=True,
+            iterations=750000,
+        )
+        with open(encrypted, "rb") as stream:
+            header = stream.read(gcmcrypt.V1_5_HEADER_LEN)
+        self.assertEqual(750000, struct.unpack(">I", header[82:86])[0])
+
+        self.capture(
+            gcmcrypt.decrypt,
+            self.PASSWORD,
+            encrypted,
+            decrypted,
+            force=True,
+        )
+        with open(decrypted, "rb") as stream:
+            self.assertEqual(b"custom iterations", stream.read())
+
+    def test_reads_legacy_v1_1_through_v1_3(self):
         data = b"legacy format data" * 5000
-        for minor_version in (1, 2):
+        for minor_version in (1, 2, 3):
             with self.subTest(minor_version=minor_version):
                 encrypted = self.path("legacy-{0}.gcm".format(minor_version))
                 output = self.path("legacy-{0}.bin".format(minor_version))
@@ -149,6 +212,57 @@ class GcmCryptTests(unittest.TestCase):
 
                 with open(output, "rb") as stream:
                     self.assertEqual(data, stream.read())
+
+    def test_rejects_non_gcmcrypt_signature_before_checking_version(self):
+        source = self.path("not-gcmcrypt.bin")
+        output = self.path("output.bin")
+        with open(source, "wb") as stream:
+            stream.write(b"NOT\xff\xff")
+
+        messages = self.capture(
+            gcmcrypt.decrypt, self.PASSWORD, source, output, force=True
+        )
+
+        self.assertIn("Input file is not a GcmCrypt file", messages)
+        self.assertNotIn("Unsupported input file version", messages)
+        self.assertFalse(os.path.exists(output))
+
+    def test_rejects_unsupported_version_after_valid_signature(self):
+        source = self.path("unsupported-version.gcm")
+        output = self.path("output.bin")
+        with open(source, "wb") as stream:
+            stream.write(gcmcrypt.MAGIC + b"\xff\xff")
+
+        messages = self.capture(
+            gcmcrypt.decrypt, self.PASSWORD, source, output, force=True
+        )
+
+        self.assertIn("Unsupported input file version", messages)
+        self.assertFalse(os.path.exists(output))
+
+    def test_invalid_pbkdf2_iterations_are_rejected_before_derivation(self):
+        source = self.path("source.bin")
+        encrypted = self.path("encrypted.gcm")
+        invalid = self.path("invalid.gcm")
+        output = self.path("output.bin")
+        with open(source, "wb") as stream:
+            stream.write(b"parameter validation")
+        self.capture(
+            gcmcrypt.encrypt, self.PASSWORD, source, encrypted, force=True
+        )
+        with open(encrypted, "rb") as stream:
+            encrypted_data = bytearray(stream.read())
+        encrypted_data[82:86] = struct.pack(">I", gcmcrypt.MIN_PBKDF2_ITERATIONS - 1)
+        with open(invalid, "wb") as stream:
+            stream.write(encrypted_data)
+
+        messages = self.capture(
+            gcmcrypt.decrypt, self.PASSWORD, invalid, output, force=True
+        )
+
+        self.assertIn("invalid PBKDF2 iteration count", messages)
+        self.assertFalse(os.path.exists(output))
+        self.assertFalse(os.path.exists(output + ".PARTIAL"))
 
     def test_complete_trailing_chunk_removal_is_detected_and_retained(self):
         source = self.path("source.bin")

@@ -79,4 +79,26 @@ foreach ($compressed in @($false, $true)) {
     Assert-SameFile $inputFile $pythonDecrypted
 }
 
+$customIterations = 750000
+$pythonCustomEncrypted = Join-Path $testDir "python-custom-iterations.gcm"
+$csharpCustomDecrypted = Join-Path $testDir "csharp-from-python-custom-iterations.bin"
+& $python $pythonScript -e -f -iter $customIterations $password $inputFile $pythonCustomEncrypted
+if ($LASTEXITCODE -ne 0) {
+    throw "Python custom-iteration encryption failed"
+}
+$pythonCustomBytes = [System.IO.File]::ReadAllBytes($pythonCustomEncrypted)
+$iterationBytes = New-Object byte[] 4
+[Array]::Copy($pythonCustomBytes, 82, $iterationBytes, 0, 4)
+if ([BitConverter]::IsLittleEndian) {
+    [Array]::Reverse($iterationBytes)
+}
+if ([BitConverter]::ToInt32($iterationBytes, 0) -ne $customIterations) {
+    throw "Python did not write the custom PBKDF2 iteration count"
+}
+& $CSharpExe -d -f $password $pythonCustomEncrypted $csharpCustomDecrypted
+if ($LASTEXITCODE -ne 0) {
+    throw "C# custom-iteration decryption failed"
+}
+Assert-SameFile $inputFile $csharpCustomDecrypted
+
 Write-Host "Python/C# interoperability smoke test passed."
